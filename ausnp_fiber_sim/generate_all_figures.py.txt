@@ -1,0 +1,999 @@
+"""Comprehensive figure regeneration for AuNP fiber LSPR paper.
+
+Run from the project root:
+    python generate_all_figures.py
+
+Fixes all known presentation issues in the original per-module plot functions:
+  - Evanescent-field y-axis numerical underflow (10^-284 range)
+  - Peak-wavelength annotation crowding in extinction spectra
+  - FOM plot cosmetics in sensitivity-vs-diameter figure
+  - Fabrication tolerance redesign (split into per-variable panels)
+  - LOD comparison x-label overlap
+  - WHO label collision in sensitivity-LOD tradeoff
+"""
+
+import sys
+import os
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.patches as mpatches
+import matplotlib.ticker as ticker
+from matplotlib.colors import Normalize
+
+# ── make sure the src package is importable ─────────────────────────────────
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+
+from src.gold_dielectric     import load_jc_data, get_gold_nk
+from src.mie_theory          import (compute_extinction_spectrum, find_lspr_peak,
+                                      compute_bulk_ri_sensitivity, sensitivity_vs_diameter)
+from src.transfer_matrix     import (compute_evanescent_field, sweep_etch_depth,
+                                      compute_propagation_constant,
+                                      _N_CORE, _N_CLAD, _CLAD_RADIUS, _CORE_RADIUS,
+                                      _DELTA_MAX, _N_SURR, _LAMBDA_NM)
+from src.lod_calculator      import (compute_lod, compute_all_lods,
+                                      benchmark_against_literature, get_ion_parameters)
+from src.validation          import (validate_mie_peak_wavelength, validate_lspr_sensitivity,
+                                      validate_evanescent_field,
+                                      _LE99_DIAMETERS, _LE99_LAMBDA,
+                                      _MOCK_N_MED, _MOCK_LAMBDA, _MOCK_SENS_REF,
+                                      _POLYNKIN_DELTA_UM, _POLYNKIN_LD_NM)
+from src.sensitivity_map     import build_sensitivity_grid, find_optimal_design
+from src.plot_style          import set_journal_style, save_figure, FIGURE_SIZES, ION_COLORS, ION_MARKERS
+
+FIG_DIR = os.path.join(ROOT, 'figures')
+os.makedirs(FIG_DIR, exist_ok=True)
+
+S_TOTAL_OPT = 78.02   # nm/RIU  — results_summary.csv authoritative value
+
+# Ion labels — LaTeX superscript for the 2+ charge (avoids missing-glyph box for U+207A)
+ION_TEX = {
+    'Cd2+': r'Cd$^{2+}$',
+    'Pb2+': r'Pb$^{2+}$',
+    'Hg2+': r'Hg$^{2+}$',
+}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def _fp(name):
+    return os.path.join(FIG_DIR, name)
+
+
+def _save(fig, name):
+    for ext in ('pdf', 'png'):
+        fig.savefig(f"{_fp(name)}.{ext}", dpi=300, bbox_inches='tight')
+    print(f"  OK  {name}.pdf / .png")
+    plt.close(fig)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fig 0 — Gold optical constants
+# ════════════════════════════════════════════════════════════════════════════
+
+def fig0_gold_optical_constants():
+    set_journal_style()
+    df = load_jc_data()
+    wl_fine = np.linspace(400, 1000, 600)
+    n_fine, k_fine = get_gold_nk(wl_fine)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(3.5, 4.8), sharex=True)
+    fig.subplots_adjust(hspace=0.08, top=0.96, bottom=0.10, left=0.18, right=0.96)
+
+    # Shaded LSPR window
+    for ax in (ax1, ax2):
+        ax.axvspan(500, 700, alpha=0.12, color='goldenrod', zorder=0)
+
+    # ── Panel (a): refractive index n ────────────────────────────────────
+    ax1.plot(wl_fine, n_fine, color='#1f77b4', lw=1.8, zorder=3, label='Interpolated')
+    ax1.scatter(df['wavelength_nm'], df['n'], s=18, color='#1f77b4',
+                zorder=4, label='J&C data')
+    ax1.set_ylabel('$n$ (real part)', fontsize=9)
+    ax1.set_ylim(-0.05, 1.65)
+    ax1.set_yticks([0, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50])
+    ax1.yaxis.set_major_locator(ticker.MultipleLocator(0.25))
+    # LSPR window label — inside shaded band
+    ax1.text(505, 1.55, 'LSPR\nwindow', fontsize=7.5, color='#8B6914',
+             va='top', ha='left')
+    ax1.legend(fontsize=8, loc='upper right', framealpha=0.9, handlelength=1.5)
+    ax1.text(0.03, 0.97, '(a)', transform=ax1.transAxes,
+             fontsize=10, fontweight='bold', va='top')
+
+    # ── Panel (b): extinction coefficient k ───────────────────────────────
+    ax2.plot(wl_fine, k_fine, color='#d62728', lw=1.8, zorder=3, label='Interpolated')
+    ax2.scatter(df['wavelength_nm'], df['k'], s=18, color='#d62728',
+                zorder=4, label='J&C data')
+    ax2.set_ylabel('$k$ (extinction coeff.)', fontsize=9)
+    ax2.set_xlabel('Wavelength (nm)', fontsize=9)
+    ax2.set_xlim(400, 1000)
+    ax2.legend(fontsize=8, loc='lower right', framealpha=0.9, handlelength=1.5)
+    ax2.text(0.03, 0.97, '(b)', transform=ax2.transAxes,
+             fontsize=10, fontweight='bold', va='top')
+
+    _save(fig, 'fig0_gold_optical_constants')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fig 1 — AuNP extinction spectra
+# ════════════════════════════════════════════════════════════════════════════
+
+def fig1_extinction_spectra():
+    set_journal_style()
+    diameters = [20, 30, 40, 50, 60, 70, 80]
+    wl = np.arange(400, 801, 0.5)
+    cmap = cm.plasma
+    norm = Normalize(vmin=min(diameters), vmax=max(diameters))
+
+    # Extra width on the right for the peak-wavelength annotation column
+    fig, ax = plt.subplots(figsize=(4.8, 3.5))
+    fig.subplots_adjust(left=0.12, right=0.75, top=0.95, bottom=0.14)
+
+    peak_data = []
+    for d in diameters:
+        spec = compute_extinction_spectrum(d, 1.333, wl)
+        color = cmap(norm(d))
+        ax.plot(spec['wavelength'], spec['Qext'], color=color, lw=1.6, zorder=3)
+        peak_wl, peak_Q, _ = find_lspr_peak(spec['wavelength'], spec['Qext'])
+        peak_data.append((d, peak_wl, peak_Q, color))
+
+    ax_ymax = max(p[2] for p in peak_data) * 1.12
+    ax.set_xlim(400, 720)
+    ax.set_ylim(0, ax_ymax)
+
+    # Annotations: sorted by diameter (ascending), evenly spaced in axes fraction
+    peak_data_sorted = sorted(peak_data, key=lambda x: x[0])
+    n_ann = len(peak_data_sorted)
+    # Spread from 8 % to 97 % height so labels don't crowd at edges
+    y_fracs = np.linspace(0.08, 0.97, n_ann)
+
+    # Label column sits just inside the right edge of the axis (x in data coords)
+    x_label = 658
+
+    for idx, (d, peak_wl, peak_Q, color) in enumerate(peak_data_sorted):
+        y_text = y_fracs[idx] * ax_ymax
+        ax.annotate(
+            f'{peak_wl:.0f} nm',
+            xy=(peak_wl + 1, peak_Q),
+            xytext=(x_label, y_text),
+            fontsize=7.5, color=color, va='center', ha='left',
+            arrowprops=dict(
+                arrowstyle='->', color=color, lw=0.7,
+                connectionstyle='arc3,rad=0.10',
+            ),
+        )
+
+    # Redshift text arrow — placed in blank region above the peaks
+    ax.annotate(
+        'Redshift',
+        xy=(535, ax_ymax * 0.93), xytext=(505, ax_ymax * 0.93),
+        fontsize=8, color='#555555', va='center', ha='right',
+        arrowprops=dict(arrowstyle='->', color='#555555', lw=1.0),
+    )
+
+    # Colorbar — placed outside the axis (tight layout already reserved space)
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.04, fraction=0.048)
+    cbar.set_label('AuNP diameter (nm)', fontsize=9)
+    cbar.set_ticks([20, 30, 40, 50, 60, 70, 80])
+    cbar.ax.tick_params(labelsize=8)
+
+    ax.set_xlabel('Wavelength (nm)', fontsize=9)
+    ax.set_ylabel('Extinction efficiency $Q_{ext}$', fontsize=9)
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(100))
+    ax.xaxis.set_minor_locator(ticker.MultipleLocator(50))
+    # Bold panel label — top-left corner
+    ax.text(0.03, 0.97, '(a)', transform=ax.transAxes,
+            fontsize=10, fontweight='bold', va='top')
+
+    _save(fig, 'fig1_extinction_spectra')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fig 2 — Sensitivity and FOM vs diameter
+# ════════════════════════════════════════════════════════════════════════════
+
+def fig2_sensitivity_diameter():
+    set_journal_style()
+    d_arr = np.arange(20, 82, 2)   # 2 nm step for smoother curve
+    data = sensitivity_vs_diameter(d_arr)
+    d   = data['diameters']
+    S   = data['sensitivity']
+    FOM = data['FOM']
+
+    # Smooth lines — connect only finite FOM points
+    fom_ok = np.isfinite(FOM)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(3.8, 4.8), sharex=True)
+    fig.subplots_adjust(hspace=0.10)
+
+    # — Top: sensitivity —
+    ax1.plot(d, S, 'o-', color='#1f77b4', lw=1.6, ms=4, zorder=3)
+    # Mark optimal diameter
+    opt_d = 80
+    opt_S = S[np.argmin(np.abs(d - opt_d))]
+    ax1.scatter([opt_d], [opt_S], s=80, color='#d62728', zorder=5, marker='*')
+    ax1.annotate(f'$d^*$ = {opt_d} nm\n$S$ = {opt_S:.1f} nm/RIU',
+                 xy=(opt_d, opt_S),
+                 xytext=(opt_d - 20, opt_S - 6),
+                 fontsize=7.5, color='#d62728', ha='right',
+                 arrowprops=dict(arrowstyle='->', color='#d62728', lw=0.8))
+    ax1.set_ylabel('$S_{LSPR}$ (nm RIU$^{-1}$)', fontsize=9)
+    ax1.set_ylim(45, 90)
+    ax1.yaxis.set_major_locator(ticker.MultipleLocator(10))
+    ax1.text(0.04, 0.96, '(a)', transform=ax1.transAxes,
+             fontsize=10, fontweight='bold', va='top')
+
+    # — Bottom: FOM — two visually distinct groups, NO connecting line
+    small = d < 38
+    large = d >= 38
+    ax2.plot(d[small], FOM[small], 'o-', color='#d62728', lw=1.6, ms=4,
+             label='$d$ < 38 nm  (narrow FWHM)')
+    ax2.plot(d[large & fom_ok], FOM[large & fom_ok], 's-', color='#d62728',
+             lw=1.6, ms=4, alpha=0.55,
+             label='$d$ ≥ 38 nm  (broad FWHM)')
+    # Shade the transition as a vertical band instead of a misleading arrow line
+    ax2.axvspan(36, 40, alpha=0.12, color='#888888', zorder=0)
+    ax2.text(41, 1.15, 'FWHM\nbroadening', fontsize=7, color='#666666',
+             va='center', ha='left')
+    ax2.set_xlabel('AuNP diameter $d$ (nm)', fontsize=9)
+    ax2.set_ylabel('Figure of Merit (FOM)', fontsize=9)
+    ax2.set_xlim(18, 84)
+    ax2.legend(fontsize=7.5, loc='upper right', framealpha=0.9)
+    ax2.text(0.04, 0.96, '(b)', transform=ax2.transAxes,
+             fontsize=10, fontweight='bold', va='top')
+
+    fig.align_ylabels([ax1, ax2])
+
+    _save(fig, 'fig2_sensitivity_diameter')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fig 3 — Evanescent field vs etch depth
+# Fix: clip I_ev axis; fix l_d singularity
+# ════════════════════════════════════════════════════════════════════════════
+
+def fig3_evanescent_field():
+    set_journal_style()
+    delta_arr = np.linspace(0, _DELTA_MAX, 500)
+    rows = [compute_evanescent_field(d) for d in delta_arr]
+    etch  = np.array([r['etch_depth_um']   for r in rows])
+    I_ev  = np.array([r['I_ev_normalised'] for r in rows])
+    l_d   = np.array([r['l_d_nm']          for r in rows])
+    t_clad = np.array([r['t_clad_um']      for r in rows])
+
+    # Clip to physically meaningful range for plotting
+    I_ev_plot = np.clip(I_ev, 1e-8, 1.0)
+    l_d_plot  = np.clip(l_d, 0, 600)     # cap at 600 nm for display
+
+    # Inflection point: where I_ev first exceeds 1%
+    thresh_idx = np.searchsorted(I_ev_plot, 0.01)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(4.0, 5.0), sharex=True)
+    fig.subplots_adjust(hspace=0.10)
+
+    # — Top: I_ev (log scale) —
+    ax1.semilogy(etch, I_ev_plot, color='#1f77b4', lw=1.8, zorder=3)
+
+    # Mark the transition into the active sensing zone with a single line
+    # (both 1% and 10% occur within the last ~0.2 µm — annotate just once)
+    idx_1pct = np.searchsorted(I_ev_plot, 0.01)
+    if 0 < idx_1pct < len(etch):
+        delta_1pct = etch[idx_1pct]
+        ax1.axvline(delta_1pct, color='#555555', ls='--', lw=1.1, alpha=0.85)
+        ax1.text(delta_1pct - 0.6, 1e-2,
+                 f'δ = {delta_1pct:.1f} µm\n($I_{{ev}}$ = 1%)',
+                 fontsize=7.5, color='#444444', va='center', ha='right')
+
+    # Region shading with visible labels
+    ax1.axvspan(0,  50, alpha=0.10, color='#1f77b4', zorder=0)
+    ax1.axvspan(50, _DELTA_MAX, alpha=0.10, color='#d62728', zorder=0)
+    ax1.text(25,  5e-5, 'Below sensing\nthreshold', ha='center',
+             fontsize=7.5, color='#1f77b4', va='center')
+    ax1.text(54.5, 5e-5, 'Active\nsensing\nzone', ha='center',
+             fontsize=7.5, color='#d62728', va='center')
+
+    ax1.set_ylabel('Normalised evanescent\nfield intensity $I_{ev}$', fontsize=9)
+    ax1.set_ylim(1e-8, 2.0)
+    ax1.yaxis.set_major_locator(ticker.LogLocator(base=10, numticks=5))
+    ax1.text(0.03, 0.97, '(a)', transform=ax1.transAxes,
+             fontsize=10, fontweight='bold', va='top')
+
+    # — Bottom: penetration depth l_d vs etch depth ————————————————————————
+    # Show l_d for ALL etch depths; cap display at 600 nm to keep y-axis
+    # readable (l_d diverges as n_eff → n_surr near full etch).
+    # The curve is nearly flat at ~83 nm across most of the range
+    # and rises sharply only in the last ~0.5 µm.
+    l_d_disp = np.clip(l_d, 0, 600)
+    ax2.plot(etch, l_d_disp, color='#ff7f0e', lw=1.8, zorder=3)
+
+    # AuNP size reference band (20–80 nm)
+    ax2.axhspan(20, 80, alpha=0.12, color='#2ca02c', zorder=0)
+    ax2.axhline(80, color='#2ca02c', ls='--', lw=1.0, alpha=0.85,
+                label='AuNP $d$ upper bound (80 nm)')
+    # "AuNP size range" label — placed in the centre of the shaded band,
+    # away from the left edge to avoid overlap with the (b) label
+    ax2.text(1.5, 50, 'AuNP size range', ha='left',
+             fontsize=7, color='#2ca02c', va='center')
+
+    # Legend at lower-right (below the curve spike, which is at far-right)
+    ax2.legend(fontsize=7.5, loc='lower right', framealpha=0.9)
+
+    ax2.set_xlabel('Cladding etch depth $\\delta$ (µm)', fontsize=9)
+    ax2.set_ylabel('Penetration depth $l_d$ (nm)', fontsize=9)
+    ax2.set_xlim(0, _DELTA_MAX)
+    ax2.set_ylim(0, 650)
+    ax2.yaxis.set_major_locator(ticker.MultipleLocator(100))
+    # Bold panel label — top-left, won't clash since legend is now lower-right
+    ax2.text(0.03, 0.97, '(b)', transform=ax2.transAxes,
+             fontsize=10, fontweight='bold', va='top')
+
+    fig.align_ylabels([ax1, ax2])
+
+    _save(fig, 'fig3_evanescent_field')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fig 3b — Fiber cross-section schematic
+# ════════════════════════════════════════════════════════════════════════════
+
+def fig3b_mode_profile(etch_depth_um=30.0):
+    set_journal_style()
+    result = compute_evanescent_field(etch_depth_um)
+    t_clad = result['t_clad_um']
+    l_d_nm = result['l_d_nm']
+
+    fig, ax = plt.subplots(figsize=(4.0, 3.6))
+    ax.set_aspect('equal')
+    ax.axis('off')
+
+    # ── Schematic dimensions (all in "schematic units") ──────────────────
+    W     = 5.0     # total width
+    h_core = 1.6    # core height
+    # Scale cladding thickness for visibility — use square root to avoid
+    # making the full-cladding case look impossibly tall
+    clad_scale = max(t_clad / _DELTA_MAX * 1.8, 0.18)
+    h_clad = clad_scale
+    h_evan = 1.2    # analyte / evanescent region shown
+
+    y0_core  = 0.0
+    y0_clad  = y0_core + h_core
+    y0_evan  = y0_clad + h_clad
+
+    def rect(ax, x0, y0, w, h, fc, ec='#333333', lw=1.2, alpha=1.0):
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (x0, y0), w, h,
+            boxstyle='square,pad=0',
+            fc=fc, ec=ec, lw=lw, alpha=alpha))
+
+    # Core
+    rect(ax, -W/2, y0_core, W, h_core, '#9e9e9e')
+    ax.text(0, y0_core + h_core/2,
+            f'Fiber core\n$n$ = {_N_CORE}',
+            ha='center', va='center', fontsize=9, fontweight='bold', color='white')
+
+    # Remaining cladding
+    rect(ax, -W/2, y0_clad, W, h_clad, '#b3d9f7')
+    ax.text(0, y0_clad + h_clad/2,
+            f'Cladding  $t$ = {t_clad:.1f} µm\n$n$ = {_N_CLAD}',
+            ha='center', va='center', fontsize=8)
+
+    # Analyte
+    rect(ax, -W/2, y0_evan, W, h_evan, '#fff2cc', alpha=0.85)
+    ax.text(0, y0_evan + h_evan * 0.70,
+            f'Analyte (water)\n$n$ = {_N_SURR}',
+            ha='center', va='center', fontsize=8)
+
+    # Evanescent field decay curve — starts at cladding/analyte interface (y=y0_evan)
+    # and decays upward into the analyte layer
+    y_decay = np.linspace(0, h_evan, 200)
+    # Scale l_d to schematic units: use a representative visible length
+    # Physical l_d_nm is ~83 nm; analyte layer is h_evan schematic units
+    # Show ~2 decay lengths visually for clarity
+    l_d_sch = h_evan * 0.30   # schematic penetration depth (for visibility)
+    x_amp   = W * 0.38         # amplitude at interface
+    x_decay = x_amp * np.exp(-y_decay / l_d_sch)
+    # Plot starting from left edge of analyte, symmetric about centre
+    ax.plot(-x_decay, y_decay + y0_evan, color='#d62728', lw=2.2, zorder=5)
+    ax.fill_betweenx(y_decay + y0_evan, -x_decay, 0,
+                     color='#d62728', alpha=0.15, zorder=4)
+    # Label the penetration depth with a horizontal brace at 1/e point
+    y_1e = y0_evan + l_d_sch
+    ax.annotate('', xy=(-x_amp * np.exp(-1), y_1e),
+                xytext=(0, y_1e),
+                arrowprops=dict(arrowstyle='<->', color='#d62728', lw=1.0))
+    ax.text(-x_amp * np.exp(-1) / 2, y_1e + 0.04,
+            f'$l_d$ = {l_d_nm:.0f} nm',
+            fontsize=7.5, color='#d62728', ha='center', va='bottom')
+
+    # Dimension arrows — etched depth (from outer surface to cladding/analyte interface)
+    x_arr = W/2 + 0.35
+    # The etched portion goes from the original outer cladding surface down to current interface
+    # Schematically: from top of remaining cladding (y0_evan) downward by h_core height
+    ax.annotate('', xy=(x_arr, y0_clad),
+                xytext=(x_arr, y0_evan),
+                arrowprops=dict(arrowstyle='<->', color='#333333', lw=1.2))
+    ax.text(x_arr + 0.12, (y0_clad + y0_evan) / 2,
+            f'$\\delta$ = {etch_depth_um:.0f} µm\n(etched)',
+            fontsize=7.5, va='center', ha='left', color='#333333')
+
+    # l_d label
+    ax.legend(handles=[
+        mpatches.Patch(color='#d62728', label=f'Evanescent field  $l_d$ = {l_d_nm:.0f} nm')
+    ], loc='lower left', fontsize=8, framealpha=0.9)
+
+    ax.set_xlim(-W/2 - 0.3, W/2 + 1.8)
+    ax.set_ylim(y0_core - 0.2, y0_evan + h_evan + 0.3)
+    ax.set_title(f'Fiber cross-section schematic  ($\\delta$ = {etch_depth_um:.0f} µm)\n'
+                 r'$\it{not\ to\ scale}$', fontsize=10, pad=6)
+
+    _save(fig, 'fig3b_mode_profile')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fig 4 — Composite sensitivity map
+# ════════════════════════════════════════════════════════════════════════════
+
+def fig4_sensitivity_map(grid_data=None):
+    set_journal_style()
+    if grid_data is None:
+        print('  Building sensitivity grid (this may take ~1 min)…')
+        grid_data = build_sensitivity_grid()
+
+    d_array = grid_data['d_array']
+    S_LSPR  = grid_data['S_LSPR']
+    opt_d   = grid_data['optimal_d_nm']
+    S_max   = grid_data['S_total_max']
+
+    d_lines   = [20, 40, 60, 80]
+    colors_b  = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+
+    from src.mie_theory import sensitivity_vs_diameter as _svd
+    from src.transfer_matrix import compute_evanescent_field as _cev, _DELTA_MAX as _DM
+    mie_b    = _svd(np.array(d_lines, dtype=float))
+    s_lspr_b = dict(zip(d_lines, mie_b['sensitivity']))
+
+    t_clad_nm  = np.linspace(0, 500, 501)
+    etch_depths = np.maximum(_DM - t_clad_nm / 1000.0, 0.0)
+    I_ev_arr    = np.array([_cev(de)['I_ev_normalised'] for de in etch_depths])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.2, 3.6))
+    fig.subplots_adjust(wspace=0.40)
+
+    # ── Panel (a): S_LSPR vs d ──────────────────────────────────────────
+    ax1.plot(d_array, S_LSPR, color='#333333', lw=1.8, zorder=3)
+
+    opt_d_idx = int(np.argmin(np.abs(d_array - opt_d)))
+    s_opt = float(S_LSPR[opt_d_idx])
+    ax1.scatter([opt_d], [s_opt], s=90, color='#d62728', zorder=5, marker='*')
+    ax1.annotate(
+        f'$d^*$ = {opt_d:.0f} nm\n$S$ = {s_opt:.1f} nm RIU$^{{-1}}$',
+        xy=(opt_d, s_opt),
+        xytext=(opt_d - 22, s_opt - 8),
+        fontsize=8, color='#d62728', ha='right',
+        arrowprops=dict(arrowstyle='->', color='#d62728', lw=0.9),
+    )
+    # Mark the four panel-b diameters with small triangles on x-axis
+    for d_val, col in zip(d_lines, colors_b):
+        ax1.axvline(d_val, color=col, lw=0.7, ls=':', alpha=0.65)
+
+    ax1.set_xlabel('AuNP diameter $d$ (nm)', fontsize=9)
+    ax1.set_ylabel('$S_{LSPR}$ (nm RIU$^{-1}$)', fontsize=9)
+    ax1.set_xlim(d_array.min() - 2, d_array.max() + 2)
+    s_lo = S_LSPR.min() * 0.96
+    s_hi = S_LSPR.max() * 1.08
+    ax1.set_ylim(s_lo, s_hi)
+    ax1.yaxis.set_major_locator(ticker.MultipleLocator(5))
+    ax1.text(0.03, 0.97, '(a)', transform=ax1.transAxes,
+             fontsize=10, fontweight='bold', va='top')
+
+    # ── Panel (b): S_total vs t_clad ────────────────────────────────────
+    y_max = 0.0
+    for d_val, col in zip(d_lines, colors_b):
+        S_line = s_lspr_b[d_val] * I_ev_arr
+        ax2.plot(t_clad_nm, S_line, lw=1.8, color=col, label=f'$d$ = {d_val} nm')
+        y_max = max(y_max, float(S_line[0]))
+
+    # Active sensing window shading
+    ax2.axvspan(0, 200, alpha=0.10, color='goldenrod', zorder=0)
+    ax2.axvline(200, color='#8B6914', lw=1.0, ls='--', alpha=0.85)
+    ax2.text(210, y_max * 0.50,
+             '$t_{clad}$ ≤ 200 nm\nactive window',
+             fontsize=7.5, color='#8B6914', va='center', ha='left')
+
+    # Annotate each line at the left edge (t_clad=0) — offset labels slightly
+    # to avoid overlap with curve peaks. Use bracket-style labels.
+    s0_vals = [(d_val, col, s_lspr_b[d_val] * I_ev_arr[0])
+               for d_val, col in zip(d_lines, colors_b)]
+    # Sort by value descending
+    s0_vals_sorted = sorted(s0_vals, key=lambda x: x[2], reverse=True)
+    y_label_fracs = [0.97, 0.88, 0.79, 0.70]
+    for (d_val, col, s0), frac in zip(s0_vals_sorted, y_label_fracs):
+        ax2.text(4, y_max * frac, f'{s0:.1f}',
+                 fontsize=7, color=col, va='center', ha='left',
+                 fontweight='bold',
+                 bbox=dict(boxstyle='round,pad=0.1', fc='white',
+                           ec=col, lw=0.5, alpha=0.85))
+
+    ax2.set_xlabel('Remaining cladding $t_{clad}$ (nm)', fontsize=9)
+    ax2.set_ylabel('$S_{total}$ (nm RIU$^{-1}$)', fontsize=9)
+    ax2.set_xlim(0, 500)
+    ax2.set_ylim(0, y_max * 1.12)
+    ax2.yaxis.set_major_locator(ticker.MultipleLocator(10))
+    ax2.legend(fontsize=8.5, loc='upper right', framealpha=0.95,
+               handlelength=1.5)
+    ax2.text(0.03, 0.97, '(b)', transform=ax2.transAxes,
+             fontsize=10, fontweight='bold', va='top')
+
+    _save(fig, 'fig4_sensitivity_map')
+    return grid_data
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fig 5 — Fabrication tolerance
+# Redesigned: TWO-PANEL. Left = d tolerance. Right = final-stage etch tolerance.
+# Fix: drop the confusing dual-x-axis; show the AuNP-size window separately
+# from the cladding-thickness window.
+# ════════════════════════════════════════════════════════════════════════════
+
+def fig5_fabrication_tolerance(grid_data=None):
+    set_journal_style()
+    if grid_data is None:
+        print('  Building sensitivity grid (this may take ~1 min)…')
+        grid_data = build_sensitivity_grid()
+
+    d     = grid_data['d_array']
+    delta = grid_data['delta_array']
+    S     = grid_data['S_total_grid']
+    opt_d = grid_data['optimal_d_nm']     # 80 nm
+    opt_delta = grid_data['optimal_delta_um']  # 58.4 µm
+    S_max = grid_data['S_total_max']
+
+    opt_d_idx    = int(np.argmin(np.abs(d - opt_d)))
+    opt_delta_idx = int(np.argmin(np.abs(delta - opt_delta)))
+
+    S_vs_d     = S[opt_delta_idx, :] / S_max   # shape (n_d,)
+
+    # For the etch tolerance: use REMAINING CLADDING (t_clad) from 0–500 nm
+    # This is what matters for final-stage etch precision
+    from src.transfer_matrix import compute_evanescent_field as _cev, _DELTA_MAX as _DM
+    from src.mie_theory import sensitivity_vs_diameter as _svd
+    mie_opt = _svd(np.array([opt_d]))[' sensitivity'][0] if False else float(
+        _svd(np.array([opt_d], dtype=float))['sensitivity'][0])
+
+    t_clad_fine = np.linspace(0, 500, 301)   # nm, remaining cladding
+    delta_fine  = np.maximum(_DM - t_clad_fine / 1000.0, 0.0)  # µm
+    I_ev_fine   = np.array([_cev(de)['I_ev_normalised'] for de in delta_fine])
+    S_vs_tclad  = mie_opt * I_ev_fine / S_max
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.2, 3.5))
+    fig.subplots_adjust(wspace=0.38)
+
+    # ── Panel (a): Sensitivity vs d — at optimal δ* ─────────────────────
+    ax1.plot(d, S_vs_d, color='#1f77b4', lw=2.0, zorder=4,
+             label=f'at $\\delta^*$ = {opt_delta:.1f} µm')
+
+    # ±10% and ±20% diameter tolerance bands
+    for pct, alpha, lbl in [(20, 0.12, '±20%'), (10, 0.22, '±10%')]:
+        d_lo = opt_d * (1 - pct / 100)
+        d_hi = opt_d * (1 + pct / 100)
+        ax1.axvspan(d_lo, d_hi, alpha=alpha, color='#1f77b4',
+                    label=f'{lbl} $d$ tolerance')
+
+    ax1.axhline(0.90, color='gray', ls=':', lw=1.2, alpha=0.9,
+                label='−10% $S$ level')
+    ax1.scatter([opt_d], [1.0], s=80, color='#d62728', zorder=5, marker='*')
+    ax1.set_xlabel('AuNP diameter $d$ (nm)', fontsize=10)
+    ax1.set_ylabel('Normalised $S_{total}$ / $S_{max}$', fontsize=10)
+    ax1.set_xlim(d.min() - 1, d.max() + 1)
+    ax1.set_ylim(0.60, 1.07)
+    ax1.yaxis.set_major_locator(ticker.MultipleLocator(0.1))
+    ax1.legend(fontsize=7.5, loc='upper left', framealpha=0.92)
+    ax1.set_title('(a) Diameter tolerance\n'
+                  f'(optimum: $d^*$ = {opt_d:.0f} nm)', fontsize=10, pad=5)
+
+    # ── Panel (b): Sensitivity vs remaining cladding t_clad ─────────────
+    ax2.plot(t_clad_fine, S_vs_tclad, color='#d62728', lw=2.0, zorder=4,
+             label=f'at $d^*$ = {opt_d:.0f} nm')
+
+    # ±50 nm and ±100 nm t_clad tolerance bands around t_clad = 0 (fully etched)
+    # The optimum is at t_clad = 0
+    for dt, alpha, lbl in [(100, 0.12, '±100 nm'), (50, 0.22, '±50 nm')]:
+        ax2.axvspan(0, dt, alpha=alpha, color='#d62728', label=f'{lbl} $t_{{clad}}$ tolerance')
+
+    ax2.axhline(0.90, color='gray', ls=':', lw=1.2, alpha=0.9,
+                label='−10% $S$ level')
+    ax2.scatter([0], [S_vs_tclad[0]], s=80, color='#d62728', zorder=5, marker='*')
+
+    ax2.set_xlabel('Remaining cladding $t_{clad}$ (nm)', fontsize=10)
+    ax2.set_ylabel('Normalised $S_{total}$ / $S_{max}$', fontsize=10)
+    ax2.set_xlim(-5, 500)
+    ax2.set_ylim(0.0, 1.10)
+    ax2.yaxis.set_major_locator(ticker.MultipleLocator(0.2))
+    ax2.legend(fontsize=7.5, loc='upper right', framealpha=0.92)
+    ax2.set_title('(b) Etch-depth tolerance\n'
+                  f'(optimum: $t_{{clad}}$ = 0 nm)', fontsize=10, pad=5)
+
+    _save(fig, 'fig5_fabrication_tolerance')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fig 6 — LOD comparison
+# Fix: x-label overlap; WHO text placement; bar label placement
+# ════════════════════════════════════════════════════════════════════════════
+
+def fig6_lod_comparison():
+    set_journal_style()
+    lod_df   = compute_all_lods(S_TOTAL_OPT)
+    lit_df   = benchmark_against_literature()
+    ions     = ['Cd2+', 'Pb2+', 'Hg2+']
+    ion_pars = get_ion_parameters()
+
+    # Explicit short display labels for benchmarks — no auto-truncation
+    REF_SHORT = {
+        'Solomonea et al. 2022 Biosensors':           'Solomonea 2022',
+        'Boruah & Biswas 2018 Sens. Act. B':          'Boruah 2018',
+        'Sadani et al. 2019 Biosens. Bioelectron.':   'Sadani 2019',
+        'Lin and Chung et al. 2021 Nanomaterials':             'Yuan 2021',
+        'Noman et al. 2022 Optics Express':                 'Noman 2021',
+        'Arregui et al. 2019 MDPI':               'Arregui 2019',
+    }
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8.0, 4.2))
+    fig.subplots_adjust(wspace=0.46)
+
+    # ── Panel (a): horizontal bar chart ─────────────────────────────────
+    lod_vals = [lod_df.loc[ion, 'LOD_ug_L'] for ion in ions]
+    who_vals = [ion_pars[ion]['who_limit_ug_L'] for ion in ions]
+    colors   = [ION_COLORS[ion] for ion in ions]
+    y_pos    = np.arange(len(ions))
+
+    ax1.barh(y_pos, lod_vals, color=colors, height=0.50, zorder=3)
+    ax1.set_xscale('log')
+
+    for i, (lod, who, ion, col) in enumerate(zip(lod_vals, who_vals, ions, colors)):
+        ax1.axvline(who, color=col, ls='--', lw=1.2, alpha=0.75)
+        ax1.text(who * 1.12, i, f'WHO = {who} µg/L',
+                 va='center', fontsize=7.5, color=col, ha='left')
+        # LOD value: show inside bar if bar is wide enough, else right of bar
+        if lod > 0.06:
+            ax1.text(lod * 0.60, i, f'{lod:.3f}',
+                     va='center', fontsize=7.5, color='white',
+                     ha='left', fontweight='bold')
+        else:
+            ax1.text(lod * 3.5, i, f'{lod:.3f}',
+                     va='center', fontsize=7.5, color=col, ha='left')
+
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels([ION_TEX[ion] for ion in ions], fontsize=10)
+    ax1.set_xlabel('Predicted LOD (µg/L)', fontsize=10)
+    ax1.set_xlim(0.04, 50)
+    ax1.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f'{v:g}'))
+    ax1.set_title('(a) Predicted LOD vs WHO limits\n'
+                  f'($S_{{total}}$ = {S_TOTAL_OPT} nm/RIU)', fontsize=10, pad=5)
+    ax1.grid(axis='x', which='both', ls=':', alpha=0.5)
+    ax1.set_axisbelow(True)
+
+    # ── Panel (b): benchmark scatter ─────────────────────────────────────
+    refs_ordered  = ['This study']
+    ref_to_idx    = {'This study': 0}
+    refs_display  = ['This study']
+    for _, row in lit_df.iterrows():
+        ref = row['Reference']
+        if ref not in ref_to_idx:
+            ref_to_idx[ref] = len(refs_ordered)
+            refs_ordered.append(ref)
+            refs_display.append(REF_SHORT.get(ref, ref.split()[0] + ' ' + ref.split()[-1]))
+
+    for ion in ions:
+        col = ION_COLORS[ion]
+        mkr = ION_MARKERS[ion]
+        ax2.scatter([0], [lod_df.loc[ion, 'LOD_ug_L']],
+                    marker=mkr, color=col, s=100, zorder=7,
+                    edgecolors='k', linewidths=0.6,
+                    label=ION_TEX[ion])
+        who = ion_pars[ion]['who_limit_ug_L']
+        ax2.axhline(who, color=col, ls=':', lw=1.0, alpha=0.45)
+        ion_lit = lit_df[lit_df['Ion'] == ion]
+        for _, row in ion_lit.iterrows():
+            x_idx = ref_to_idx[row['Reference']]
+            ax2.scatter([x_idx], [row['LOD_ug_L']],
+                        marker=mkr, color=col, s=55, alpha=0.80, zorder=5)
+
+    # WHO annotations — placed inside the plot at right margin, staggered
+    n_refs = len(refs_ordered)
+    x_who = n_refs - 0.55
+    who_items = sorted([(ion_pars[ion]['who_limit_ug_L'], ion) for ion in ions])
+    y_used = []
+    for who, ion in who_items:
+        # Adjust if too close to previous
+        y_place = who
+        for yp in y_used:
+            if abs(np.log10(y_place) - np.log10(yp)) < 0.20:
+                y_place = yp * 10 ** 0.22
+        y_used.append(y_place)
+        ax2.text(x_who, y_place,
+                 f'WHO={who}', fontsize=6.5,
+                 color=ION_COLORS[ion], va='center', ha='right',
+                 bbox=dict(boxstyle='round,pad=0.15', fc='white',
+                           ec=ION_COLORS[ion], lw=0.5, alpha=0.85))
+
+    ax2.set_yscale('log')
+    ax2.set_xticks(np.arange(len(refs_display)))
+    ax2.set_xticklabels(refs_display, rotation=45, ha='right', fontsize=7.5)
+    ax2.set_ylabel('LOD (µg/L)', fontsize=10)
+    ax2.set_xlim(-0.6, n_refs - 0.1)
+    ax2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f'{v:g}'))
+    ax2.legend(fontsize=8.5, title='Ion', title_fontsize=8.5,
+               framealpha=0.92, loc='upper right')
+    ax2.set_title('(b) Benchmark vs literature', fontsize=10, pad=5)
+
+    _save(fig, 'fig6_lod_comparison')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fig 7 — Sensitivity–LOD tradeoff
+# Fix: WHO label collision; inversion; legend placement
+# ════════════════════════════════════════════════════════════════════════════
+
+def fig7_sensitivity_lod_tradeoff():
+    set_journal_style()
+    S_range  = np.logspace(np.log10(50), np.log10(500), 300)
+    ions     = ['Cd2+', 'Pb2+', 'Hg2+']
+    ion_pars = get_ion_parameters()
+
+    fig, ax = plt.subplots(figsize=(4.2, 4.5))
+    fig.subplots_adjust(right=0.88)   # leave room for WHO labels on right
+
+    # Ion curves
+    lod_curves = {}
+    for ion in ions:
+        lods = np.array([compute_lod(ion, S)['LOD_ug_L'] for S in S_range])
+        lod_curves[ion] = lods
+        ax.loglog(S_range, lods, color=ION_COLORS[ion], lw=2.0,
+                  label=ION_TEX[ion])
+
+    # Mark optimal S* with a vertical dashed line
+    ax.axvline(S_TOTAL_OPT, color='#555555', ls='--', lw=1.2, alpha=0.85)
+    # Place label horizontally just above the bottom axis
+    ax.text(S_TOTAL_OPT, 1.4e-3,
+            f'$S^*$={S_TOTAL_OPT:.0f}',
+            fontsize=7.5, color='#555555', ha='center', va='bottom',
+            bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='#888888',
+                      lw=0.6, alpha=0.9))
+
+    # WHO horizontal lines — labelled on the RIGHT inside the axes
+    who_items = sorted([(ion_pars[ion]['who_limit_ug_L'], ion) for ion in ions],
+                       reverse=True)
+    for who, ion in who_items:
+        col = ION_COLORS[ion]
+        ax.axhline(who, color=col, ls='--', lw=1.0, alpha=0.55)
+        # Right-side label — use axes transform to stay inside
+        ax.text(0.985, who, f'WHO = {who}',
+                transform=ax.get_yaxis_transform(),
+                fontsize=7, color=col, va='center', ha='right',
+                bbox=dict(boxstyle='round,pad=0.15', fc='white',
+                          ec=col, lw=0.5, alpha=0.9))
+
+    # Mark our predicted LODs at S*
+    for ion in ions:
+        lod_at_opt = compute_lod(ion, S_TOTAL_OPT)['LOD_ug_L']
+        ax.scatter([S_TOTAL_OPT], [lod_at_opt],
+                   marker=ION_MARKERS[ion], color=ION_COLORS[ion],
+                   s=80, zorder=7, edgecolors='k', linewidths=0.6)
+
+    ax.set_xlabel('Composite sensitivity $S_{total}$ (nm RIU$^{-1}$)', fontsize=10)
+    ax.set_ylabel('Predicted LOD (µg/L)', fontsize=10)
+    ax.set_title('LOD vs sensor sensitivity', fontsize=11, pad=6)
+    ax.set_xlim(50, 500)
+    ax.set_ylim(5e-4, 50)
+    ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f'{v:g}'))
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f'{v:g}'))
+
+    # Clean x-axis ticks: 50, 100, 200, 500
+    ax.set_xticks([50, 100, 200, 500])
+    ax.get_xaxis().set_major_formatter(ticker.FuncFormatter(lambda v, _: f'{v:g}'))
+
+    ax.legend(fontsize=9, loc='lower left', framealpha=0.92,
+              title='Ion', title_fontsize=9)
+
+    # Direction annotation (bottom-right, inside)
+    ax.text(0.98, 0.04, 'Lower LOD = better',
+            transform=ax.transAxes, fontsize=7.5,
+            ha='right', va='bottom', color='gray', style='italic')
+
+    _save(fig, 'fig7_sensitivity_lod_tradeoff')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fig Validation — three-panel validation figure
+# Fix: clip evanescent I_ev to meaningful range; improve layout
+# ════════════════════════════════════════════════════════════════════════════
+
+def fig_validation():
+    """Three-panel validation figure — Nature publication standard.
+
+    (a) Mie peak wavelength parity plot vs Link & El-Sayed (1999).
+    (b) LSPR bulk sensitivity slope comparison vs Mock et al. (2003).
+    (c) Evanescent penetration depth l_d vs etch depth vs Polynkin (2005).
+        Replaces the former I_ev log plot, where the Polynkin star was stuck
+        at the 1e-8 clipping floor — a physically misleading representation.
+        l_d is the intrinsic evanescent decay length (in nm); it is directly
+        comparable between our model and the Polynkin reference.
+    """
+    from scipy.stats import linregress as _linreg
+
+    set_journal_style()
+    v_mie  = validate_mie_peak_wavelength()
+    v_sens = validate_lspr_sensitivity()
+    v_evan = validate_evanescent_field()
+
+    # l_d sweep data for panel (c) — sweep_etch_depth already returns l_d_nm
+    tmm_df = sweep_etch_depth(np.linspace(0, _DELTA_MAX, 400))
+
+    fig, axes = plt.subplots(1, 3, figsize=(7.2, 3.8))
+    fig.subplots_adjust(wspace=0.46, left=0.09, right=0.97, top=0.93, bottom=0.16)
+
+    _PAN = dict(fontsize=9, fontweight='bold', va='top', ha='left')
+
+    # ── Panel (a): Mie peak wavelength parity plot ────────────────────────
+    ax = axes[0]
+    vm = v_mie
+    valid    = np.isfinite(vm['lambda_predicted'].values)
+    meas     = vm['lambda_measured'].values[valid]
+    pred     = vm['lambda_predicted'].values[valid]
+    in_range = vm['in_sim_range'].values[valid]
+
+    ax.scatter(meas[~in_range], pred[~in_range],
+               color='#aaaaaa', s=38, zorder=4, edgecolors='none',
+               label='$d$ < 20 nm')
+    ax.scatter(meas[in_range], pred[in_range],
+               color='#1f77b4', s=52, zorder=5, edgecolors='none',
+               label='$d$ ≥ 20 nm')
+
+    lo = min(meas.min(), pred.min()) - 2
+    hi = max(meas.max(), pred.max()) + 2
+    ax.plot([lo, hi], [lo, hi], 'k--', lw=1.0, zorder=3, label='1:1 line')
+    ax.fill_between([lo, hi], [lo - 3, hi - 3], [lo + 3, hi + 3],
+                   color='gray', alpha=0.12, zorder=1, label='±3 nm band')
+
+    r2  = np.corrcoef(meas[in_range], pred[in_range])[0, 1] ** 2
+    mxr = np.max(np.abs(pred[in_range] - meas[in_range]))
+    ax.text(0.97, 0.05,
+            f'$R^2$ = {r2:.3f}\nMax res. = {mxr:.1f} nm\n($d$ ≥ 20 nm)',
+            transform=ax.transAxes, fontsize=7.5, va='bottom', ha='right',
+            bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='none', alpha=0.85))
+    ax.set_xlabel('Measured $\\lambda_{\\rm LSPR}$ (nm)', fontsize=9)
+    ax.set_ylabel('Predicted $\\lambda_{\\rm LSPR}$ (nm)', fontsize=9)
+    ax.legend(fontsize=7, loc='upper left', framealpha=0.9, handletextpad=0.3)
+    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+    ax.set_aspect('equal', adjustable='box')
+    ax.text(0.03, 0.97, '(a)', transform=ax.transAxes, **_PAN)
+
+    # ── Panel (b): λ_LSPR vs n_med with linear fits ───────────────────────
+    ax = axes[1]
+    n_fit = np.linspace(_MOCK_N_MED[0] - 0.02, _MOCK_N_MED[-1] + 0.02, 100)
+
+    # Mock et al. linear fit
+    sl_m, ic_m, *_ = _linreg(_MOCK_N_MED, _MOCK_LAMBDA)
+    ax.plot(n_fit, sl_m * n_fit + ic_m, color='#d62728', lw=1.2, ls='--', zorder=3)
+    ax.scatter(_MOCK_N_MED, _MOCK_LAMBDA,
+               color='#d62728', s=55, zorder=5, edgecolors='none',
+               label=f'Mock 2003  ($S$ = {sl_m:.0f} nm/RIU)')
+
+    # This model — line + scatter
+    our_peaks = v_sens.get('our_peaks', np.full(len(_MOCK_N_MED), np.nan))
+    valid_p   = np.isfinite(our_peaks)
+    if valid_p.any():
+        sl_o, ic_o, *_ = _linreg(_MOCK_N_MED[valid_p], our_peaks[valid_p])
+        ax.plot(n_fit, sl_o * n_fit + ic_o, color='#1f77b4', lw=1.2, ls='--', zorder=3)
+        ax.scatter(_MOCK_N_MED[valid_p], our_peaks[valid_p],
+                   color='#1f77b4', s=50, zorder=5, edgecolors='none',
+                   label=f'This model  ($S$ = {sl_o:.0f} nm/RIU)')
+
+    ax.text(0.97, 0.03,
+            f'Error: {v_sens["percent_error"]:.1f}%',
+            transform=ax.transAxes, fontsize=7.5, va='bottom', ha='right',
+            color='#555555',
+            bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='none', alpha=0.85))
+    ax.set_xlabel('Medium refractive index $n$', fontsize=9)
+    ax.set_ylabel('LSPR peak $\\lambda$ (nm)', fontsize=9)
+    ax.legend(fontsize=7, loc='upper left', framealpha=0.9)
+    ax.text(0.03, 0.97, '(b)', transform=ax.transAxes, **_PAN)
+
+    # ── Panel (c): Penetration depth l_d vs etch depth ────────────────────
+    # Key comparison: at δ = 40 µm Polynkin (2005) measured l_d = 150 nm.
+    # Our TMM model at the same etch depth gives v_evan['our_ld_nm'].
+    ax = axes[2]
+    ld_vals    = tmm_df['l_d_nm'].values
+    delta_vals = tmm_df['etch_depth_um'].values
+
+    # Cap at 500 nm so the reference line sits centrally in the axes
+    ld_disp = np.clip(ld_vals, 0, 500)
+    ax.plot(delta_vals, ld_disp, color='#2ca02c', lw=1.8, zorder=4,
+            label='This model')
+
+    # Polynkin (2005) reference horizontal line
+    ax.axhline(_POLYNKIN_LD_NM, color='#d62728', ls='--', lw=1.3, zorder=3,
+               label=f'Polynkin 2005  ($l_d$ = {_POLYNKIN_LD_NM:.0f} nm)')
+
+    # Mark our model prediction at the Polynkin measurement depth
+    our_ld = v_evan['our_ld_nm']
+    ax.scatter([_POLYNKIN_DELTA_UM], [our_ld],
+               marker='o', s=68, color='#2ca02c', zorder=6,
+               edgecolors='k', linewidths=0.8)
+
+    # Annotate the model point — text placed above-right, arrow to point
+    ax.annotate(
+        f'Model: {our_ld:.0f} nm\n($\\delta$ = {_POLYNKIN_DELTA_UM:.0f} µm)',
+        xy=(_POLYNKIN_DELTA_UM, our_ld),
+        xytext=(_POLYNKIN_DELTA_UM + 7, our_ld + 65),
+        fontsize=7.5, color='#2ca02c',
+        arrowprops=dict(arrowstyle='->', color='#2ca02c', lw=0.9,
+                        connectionstyle='arc3,rad=-0.2'),
+        bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.8)
+    )
+
+    ax.text(0.97, 0.03,
+            f'Error vs. ref: {v_evan["percent_error"]:.1f}%',
+            transform=ax.transAxes, fontsize=7.5, va='bottom', ha='right',
+            color='#555555',
+            bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='none', alpha=0.85))
+
+    ax.set_xlabel('Etch depth $\\delta$ (µm)', fontsize=9)
+    ax.set_ylabel('Penetration depth $l_d$ (nm)', fontsize=9)
+    ax.set_xlim(0, _DELTA_MAX)
+    ax.set_ylim(0, 500)
+    ax.legend(fontsize=7, loc='upper left', framealpha=0.9)
+    ax.text(0.03, 0.97, '(c)', transform=ax.transAxes, **_PAN)
+
+    _save(fig, 'fig_validation')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Main
+# ════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print('Regenerating all figures …\n')
+
+    print('[1/9]  fig0 — gold optical constants')
+    fig0_gold_optical_constants()
+
+    print('[2/9]  fig1 — extinction spectra')
+    fig1_extinction_spectra()
+
+    print('[3/9]  fig2 — sensitivity & FOM vs diameter')
+    fig2_sensitivity_diameter()
+
+    print('[4/9]  fig3 — evanescent field vs etch depth')
+    fig3_evanescent_field()
+
+    print('[5/9]  fig3b — fiber cross-section schematic')
+    fig3b_mode_profile(etch_depth_um=30.0)
+
+    print('[6/9]  fig4 & fig5 — sensitivity map + fabrication tolerance')
+    print('        Building sensitivity grid …')
+    gd = build_sensitivity_grid()
+    fig4_sensitivity_map(gd)
+    fig5_fabrication_tolerance(gd)
+
+    print('[7/9]  fig6 — LOD comparison')
+    fig6_lod_comparison()
+
+    print('[8/9]  fig7 — sensitivity–LOD tradeoff')
+    fig7_sensitivity_lod_tradeoff()
+
+    print('[9/9]  fig_validation — model validation')
+    fig_validation()
+
+    print('\nAll figures saved to', FIG_DIR)
+
+
+if __name__ == '__main__':
+    main()
