@@ -89,9 +89,9 @@ Runtime: \~30 seconds on a modern laptop.
 
 * Uses surface-effective dn/dc values calibrated from published sensors:
 
-  * Cd2+/L-Cys: 53,000 RIU/(mol/L) \[Solomonea et al. 2022]
-  * Pb2+/GSH: 42,000 RIU/(mol/L) \[Boruah and Biswas et al. 2018]
-  * Hg2+/11-MUA: 750,000 RIU/(mol/L) \[Sadani et al. 2019]
+  * Cd2+/BSA: 53,000 RIU/(mol/L) \[Solomonea et al. 2022]
+  * Pb2+/Oxalic acid : 42,000 RIU/(mol/L) \[Boruah and Biswas et al. 2018]
+  * Hg2+/Chitosan capping: 750,000 RIU/(mol/L) \[Sadani et al. 2019]
 * Instrument noise: sigma\_lambda = 0.01 nm (Ocean Insight USB4000)
 * LOD = 3\*sigma\_lambda / S\_total (3-sigma criterion)
 
