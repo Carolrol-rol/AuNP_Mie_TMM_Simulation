@@ -93,9 +93,9 @@ Surface-effective dn/dc values calibrated from published sensors:
 
 | Ion | Ligand | dn/dc (RIU·L/mol) | Source |
 |---|---|---|---|
-| Cd2+ | L-Cystine | 53,000 | Şolomonea et al. (2022) |
-| Pb2+ | Glutathione | 42,000 | Boruah & Biswas (2018) |
-| Hg2+ | 11-Mercaptoundecanoic acid | 750,000 | Sadani et al. (2019) |
+| Cd2+ | Bovine serum albumin | 53,000 | Şolomonea et al. (2022) |
+| Pb2+ | Oxalic acid | 42,000 | Boruah & Biswas (2018) |
+| Hg2+ | Chitosan capping| 750,000 | Sadani et al. (2019) |
 
 - Instrument noise: σ_λ = 0.01 nm (Ocean Insight USB4000)
 - LOD = 3 × σ_λ / S_total (IUPAC 3-sigma criterion)
