@@ -6,7 +6,7 @@
 with Gold Nanoparticles for Heavy Metal Ion Detection: A Mie Theory and Transfer
 Matrix Parametric Study"
 
-> Target journal: *Plasmonics* (Springer) — update citation block below upon acceptance.
+> Target journal: *Name of Journal* (Name of Publisher) — update citation block below upon acceptance.
 
 ## Requirements
 
@@ -105,7 +105,7 @@ Surface-effective dn/dc values calibrated from published sensors:
 If you use this code, please cite:
 
 ```
-[Author list] (2026). [Paper title]. Plasmonics.
+[Author list] (2026). [Paper title]. Name of Journal.
 DOI: [to be assigned upon publication]
 Zenodo: https://doi.org/10.5281/zenodo.20156295
 ```
